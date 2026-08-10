@@ -206,6 +206,12 @@ async def _save_result(
     latency_ms: int,
 ):
     """Persist evaluation result + version snapshot + mark item completed."""
+    # The item was claimed in an earlier (now closed) session, so it is
+    # detached here. Without the merge, setting ``item.status`` below and
+    # calling ``session.commit()`` silently drops the change: the item would
+    # stay "running" until lease expiry + recovery re-queues it, and the
+    # parent job would never reach a terminal state.
+    item = await session.merge(item)
     version = RankEvaluationVersion(
         evaluation_id=evaluation.id,
         user_id=item.user_id,
@@ -303,6 +309,20 @@ async def _maybe_complete_job(session: AsyncSession, execution_job_id: str):
                 job.last_error = first_err or "All ranking items failed."
 
 
+async def _requeue_item(session: AsyncSession, item: ExecutionJobItem) -> None:
+    """Release a failed item back to the queue for a later retry.
+
+    The item is detached (claimed in an earlier session), so it must be
+    merged before mutating — otherwise the requeue is silently lost and the
+    item only recovers later via lease expiry.
+    """
+    item = await session.merge(item)
+    item.status = "queued"
+    item.worker_id = None
+    item.locked_until = None
+    await session.commit()
+
+
 async def _save_failure(
     session: AsyncSession,
     item: ExecutionJobItem,
@@ -310,6 +330,7 @@ async def _save_failure(
     error_code: str,
 ):
     """Mark item as failed after exhausting retries."""
+    item = await session.merge(item)
     item.status = "failed"
     item.last_error = error[:500]
     item.last_error_code = error_code
@@ -373,7 +394,13 @@ async def _call_llm(
     kwargs = _build_kwargs(provider, model, api_key, api_base)
     kwargs["temperature"] = temperature
     kwargs["max_tokens"] = max_tokens
-    kwargs["timeout"] = 30
+    # Configurable timeout (default 180s): big models on NVIDIA NIM routinely
+    # take 60-90s+ for a single ranking response. A hardcoded 30s times them out.
+    kwargs["timeout"] = get_settings().llm_timeout
+    # Disable the SDK's internal retries (OpenAI client defaults to 2). The
+    # worker's queue already retries items up to MAX_RETRIES, so internal
+    # retries only stack the wait (3 × timeout) with no extra resilience.
+    kwargs["num_retries"] = 0
 
     if output_schema is not None:
         schema_json = output_schema.model_json_schema()
@@ -596,10 +623,7 @@ async def _worker_main():
                         if (item.attempt_count or 0) >= MAX_RETRIES:
                             await _save_failure(db, item, str(exc), "server_error")
                         else:
-                            item.status = "queued"
-                            item.worker_id = None
-                            item.locked_until = None
-                            await db.commit()
+                            await _requeue_item(db, item)
                             logger.info("Item %s returned to queue (retry %d/%d)", item.id, item.attempt_count, MAX_RETRIES)
                 except Exception as save_err:
                     logger.error("Failed to update item %s after error: %s", item.id, save_err)
@@ -615,10 +639,7 @@ async def _worker_main():
     if _current_item is not None:
         try:
             async with _worker_session_factory() as db:
-                _current_item.status = "queued"
-                _current_item.worker_id = None
-                _current_item.locked_until = None
-                await db.commit()
+                await _requeue_item(db, _current_item)
                 logger.info("Released item %s back to queue during shutdown", _current_item.id)
         except Exception as exc:
             logger.error("Failed to release item during shutdown: %s", exc)

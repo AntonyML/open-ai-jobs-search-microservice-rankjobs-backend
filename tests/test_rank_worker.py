@@ -7,6 +7,7 @@ microservice.
 
 import pytest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -219,3 +220,297 @@ async def test_parent_job_failed_when_all_items_fail(db_session):
     )).scalar_one()
     assert job.status == "failed"
     assert job.last_error == "boom"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Regression tests — bugs que antes se colaban pese a la suite verde
+# (timeout hardcodeado, retries internos del SDK, item detached que no
+# persistía su estado, semántica de retry/failure de la cola)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+async def worker_engine():
+    """Engine aislado para el flujo de procesamiento del worker."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
+async def worker_session_factory(worker_engine):
+    """Factory con expire_on_commit=False, igual que la del worker real."""
+    return async_sessionmaker(
+        worker_engine, class_=AsyncSession, expire_on_commit=False
+    )
+
+
+async def _seed_processing_data(db: AsyncSession):
+    """Sembrar user + candidate + job + provider credential + cola completa."""
+    from app.db.models import ProviderCredential
+
+    user = User(
+        id="proc-user",
+        email="proc@example.com",
+        hashed_password="fakehash",
+        full_name="Proc User",
+        active_provider="openai",
+    )
+    db.add(user)
+    candidate = CandidateProfile(
+        user_id=user.id,
+        location="Copenhagen, Denmark",
+        skills={"programming_ml": [{"language": "Python", "proficiency": "Expert"}]},
+        experience=[{
+            "title": "ML Engineer", "company": "Acme",
+            "start_date": "2020-01", "end_date": "Present",
+        }],
+    )
+    db.add(candidate)
+    db.add(ProviderCredential(
+        user_id=user.id,
+        provider="openai",
+        api_key_encrypted="sk-plaintext-fallback",
+    ))
+    job = JobPosting(
+        user_id=user.id,
+        portal="linkedin",
+        external_id="ext-proc-1",
+        title="ML Engineer",
+        company="TechCorp",
+        location="Copenhagen",
+        status="new",
+        description="Build ML systems with Python.",
+    )
+    db.add(job)
+    await db.flush()
+
+    exec_job = ExecutionJob(
+        user_id=user.id,
+        pipeline="rank",
+        status="queued",
+        description="test proc",
+        output_schema="RankResult",
+    )
+    db.add(exec_job)
+    await db.flush()
+
+    item = ExecutionJobItem(
+        execution_job_id=exec_job.id,
+        job_posting_id=job.id,
+        user_id=user.id,
+        status="queued",
+    )
+    db.add(item)
+    await db.commit()
+    await db.refresh(item)
+    return {"user": user, "job": job, "exec_job": exec_job, "item": item}
+
+
+async def _valid_rank_json():
+    import json
+
+    return json.dumps({
+        "behavioral_score": 80,
+        "career_score": 70,
+        "strengths": ["Strong Python and ML background"],
+        "gaps": ["Limited cloud experience"],
+        "red_flags": [],
+        "confidence": "high",
+    })
+
+
+@pytest.mark.asyncio
+async def test_call_llm_uses_configurable_timeout_and_disables_internal_retries(monkeypatch):
+    """Regression: el worker timeouteaba a 30s hardcodeados y el SDK de OpenAI
+    reintentaba 2x internamente (3 x timeout de espera). Ahora usa LLM_TIMEOUT
+    configurable y num_retries=0 (el retry lo gestiona la cola)."""
+    from app.core.settings import get_settings
+    from app.schemas.rank import RankQualitativeOutput
+    from app.worker import _call_llm
+
+    monkeypatch.setattr(get_settings(), "llm_timeout", 123)
+    captured = {}
+
+    async def fake_acompletion(messages=None, **kwargs):
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(choices=[
+            SimpleNamespace(message=SimpleNamespace(
+                content='{"behavioral_score": 80, "career_score": 70, "strengths": ["s"], "gaps": ["g"], "red_flags": [], "confidence": "high"}',
+                reasoning_content=None,
+            ))
+        ])
+
+    monkeypatch.setattr("app.worker.litellm.acompletion", fake_acompletion)
+
+    raw = await _call_llm(
+        messages=[{"role": "user", "content": "hi"}],
+        output_schema=RankQualitativeOutput,
+        provider="openai",
+        model="gpt-4o",
+        api_key="sk-test",
+        api_base=None,
+    )
+
+    assert captured["kwargs"]["timeout"] == 123, (
+        "timeout debe venir de LLM_TIMEOUT (configurable), no de un 30 hardcodeado"
+    )
+    assert captured["kwargs"]["num_retries"] == 0, (
+        "los reintentos internos del SDK deben estar desactivados"
+    )
+    assert captured["kwargs"]["model"] == "openai/gpt-4o"
+    assert captured["kwargs"]["response_format"]["type"] == "json_object"
+    assert captured["kwargs"]["response_format"]["response_schema"]["name"] == "RankQualitativeOutput"
+    assert '"behavioral_score": 80' in raw
+
+
+@pytest.mark.asyncio
+async def test_call_llm_raises_on_empty_content(monkeypatch):
+    from app.worker import _call_llm
+
+    async def fake_acompletion(messages=None, **kwargs):
+        return SimpleNamespace(choices=[
+            SimpleNamespace(message=SimpleNamespace(content=None, reasoning_content=None))
+        ])
+
+    monkeypatch.setattr("app.worker.litellm.acompletion", fake_acompletion)
+
+    with pytest.raises(ValueError, match="empty response"):
+        await _call_llm(
+            messages=[{"role": "user", "content": "hi"}],
+            output_schema=None,
+            provider="openai", model="gpt-4o", api_key="k", api_base=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_process_item_end_to_end_completes_rank(worker_session_factory, monkeypatch):
+    """Regression LOAD→RANK→SAVE: el item debe quedar 'completed' en la BD,
+    el job 'ranked' y el parent 'completed'. Antes el item detached no persistía
+    su estado, el parent nunca terminaba y el polling del frontend colgaba."""
+    from app.db.models import RankEvaluation, RankEvaluationVersion
+    from app.worker import _process_item
+
+    async with worker_session_factory() as db:
+        seed = await _seed_processing_data(db)
+
+    monkeypatch.setattr("app.worker._worker_session_factory", worker_session_factory)
+    monkeypatch.setattr(
+        "app.worker._call_llm",
+        lambda messages, output_schema, provider, model, api_key, api_base: _valid_rank_json(),
+    )
+
+    await _process_item(seed["item"])
+
+    async with worker_session_factory() as db:
+        item = (await db.execute(
+            select(ExecutionJobItem).where(ExecutionJobItem.id == seed["item"].id)
+        )).scalar_one()
+        job = (await db.execute(
+            select(JobPosting).where(JobPosting.id == seed["job"].id)
+        )).scalar_one()
+        parent = (await db.execute(
+            select(ExecutionJob).where(ExecutionJob.id == seed["exec_job"].id)
+        )).scalar_one()
+        evals = (await db.execute(select(RankEvaluation))).scalars().all()
+        versions = (await db.execute(select(RankEvaluationVersion))).scalars().all()
+
+    assert item.status == "completed"
+    assert item.finished_at is not None
+    assert item.locked_until is None
+    assert job.status == "ranked"
+    assert job.rank_score is not None
+    assert job.rank_verdict is not None
+    assert job.rank_date is not None
+    assert parent.status == "completed"
+    assert parent.finished_at is not None
+    assert len(evals) == 1
+    assert evals[0].overall_score > 0
+    assert len(versions) == 1
+    assert versions[0].model_provider == "openai"
+
+
+@pytest.mark.asyncio
+async def test_process_item_propagates_llm_error(worker_session_factory, monkeypatch):
+    """Un fallo del LLM debe propagarse como LLMError (el retry lo gestiona la cola)."""
+    from app.exceptions import LLMError
+    from app.worker import _process_item
+
+    async with worker_session_factory() as db:
+        seed = await _seed_processing_data(db)
+
+    monkeypatch.setattr("app.worker._worker_session_factory", worker_session_factory)
+
+    async def boom(messages, output_schema, provider, model, api_key, api_base):
+        raise TimeoutError("LLM timed out")
+
+    monkeypatch.setattr("app.worker._call_llm", boom)
+
+    with pytest.raises(LLMError, match="LLM evaluation failed"):
+        await _process_item(seed["item"])
+
+
+@pytest.mark.asyncio
+async def test_failed_item_below_max_retries_is_requeued(worker_session_factory):
+    """Regression: tras un fallo transitorio (retry 1/3) el item debe volver a
+    'queued' sin worker ni lease — no quedarse 'running' hasta que expire."""
+    from app.worker import MAX_RETRIES, _requeue_item
+
+    async with worker_session_factory() as db:
+        seed = await _seed_processing_data(db)
+        item = seed["item"]
+        item.status = "running"
+        item.worker_id = "worker-1"
+        item.locked_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        item.attempt_count = 1
+        await db.commit()
+        item_id = item.id
+
+    assert 1 < MAX_RETRIES
+
+    async with worker_session_factory() as db:
+        await _requeue_item(db, item)
+
+    async with worker_session_factory() as db:
+        row = (await db.execute(
+            select(ExecutionJobItem).where(ExecutionJobItem.id == item_id)
+        )).scalar_one()
+
+    assert row.status == "queued"
+    assert row.worker_id is None
+    assert row.locked_until is None
+
+
+@pytest.mark.asyncio
+async def test_save_failure_marks_item_failed_and_parent_job_failed(worker_session_factory):
+    """Al agotar reintentos el item pasa a 'failed' con error y el parent job se
+    marca 'failed' con el primer error visible en el frontend."""
+    from app.worker import _save_failure
+
+    async with worker_session_factory() as db:
+        seed = await _seed_processing_data(db)
+        item = seed["item"]
+        item.status = "running"
+        item.attempt_count = 3
+        await db.commit()
+        item_id = item.id
+
+    async with worker_session_factory() as db:
+        await _save_failure(db, item, "LLM evaluation failed: boom", "server_error")
+
+    async with worker_session_factory() as db:
+        row = (await db.execute(
+            select(ExecutionJobItem).where(ExecutionJobItem.id == item_id)
+        )).scalar_one()
+        parent = (await db.execute(
+            select(ExecutionJob).where(ExecutionJob.id == seed["exec_job"].id)
+        )).scalar_one()
+
+    assert row.status == "failed"
+    assert row.last_error == "LLM evaluation failed: boom"
+    assert row.last_error_code == "server_error"
+    assert parent.status == "failed"
+    assert parent.last_error == "LLM evaluation failed: boom"
+    assert parent.finished_at is not None
