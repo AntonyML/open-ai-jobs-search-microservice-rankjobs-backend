@@ -11,8 +11,23 @@ datos (la cola). Corre como un proceso worker independiente (asyncio).
 
 ---
 
+## Repositorios del ecosistema
+
+Open Ai Jobs Search es un **sistema multi-repositorio**: el proyecto completo
+está compuesto por 4 repositorios que comparten la base de datos (Supabase).
+
+| Repositorio | Rol | Puerto |
+|---|---|---|
+| [**Frontend (Next.js)**](https://github.com/AntonyML/open-ai-jobs-search-nextjs-frontend) | UI de usuario | `:3000` |
+| [**Backend FastAPI**](https://github.com/AntonyML/open-ai-jobs-search-FastAPI-backend) | API principal + LLM Orchestrator | `:8000` |
+| [**Microservicio de Ingesta**](https://github.com/AntonyML/open-ai-jobs-search-microservice-searchjobs-backend) | Telegram → `ingested_jobs` (sin LLM) | `:8001` |
+| [**Microservicio de Ranking**](https://github.com/AntonyML/open-ai-jobs-search-microservice-rankjobs-backend) | Cola de ranking con LLM (LOAD/RANK/SAVE) — **este repo** | `:8002` |
+
+---
+
 ## Tabla de contenidos
 
+- [Repositorios del ecosistema](#repositorios-del-ecosistema)
 - [Qué NO es](#qué-no-es)
 - [Arquitectura](#arquitectura)
 - [Fases del worker (CLAIM → LOAD → RANK → SAVE)](#fases-del-worker-claim--load--rank--save)
@@ -253,13 +268,14 @@ python -m venv .venv
 pip install -e ".[dev]"
 ```
 
-Crea tu `.env` con las variables de la [tabla de abajo](#variables-de-entorno)
-(el repo no incluye `.env.example` todavía). Al menos:
+Copia el template y edítalo:
 
+```powershell
+Copy-Item .env.example .env
+# edita DATABASE_URL y JWT_SECRET_KEY (los mismos que la API principal)
 ```
-DATABASE_URL=postgresql+asyncpg://...   # la misma que la API principal
-JWT_SECRET_KEY=...                       # el mismo que la API principal
-```
+
+Todas las variables están documentadas en la [tabla de abajo](#variables-de-entorno).
 
 ---
 
