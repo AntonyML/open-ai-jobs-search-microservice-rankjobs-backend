@@ -249,7 +249,7 @@ def _validate_output_dict(data: dict) -> RankQualitativeOutput:
     strengths = data.get("strengths", [])
     gaps = data.get("gaps", [])
     red_flags = data.get("red_flags", [])
-    _check_list_lengths(strengths, gaps, red_flags)
+    strengths, gaps, red_flags = _check_list_lengths(strengths, gaps, red_flags)
 
     confidence = data.get("confidence", "medium")
     if confidence not in ("low", "medium", "high"):
@@ -266,27 +266,58 @@ def _validate_output_dict(data: dict) -> RankQualitativeOutput:
 
 
 def _validate_output_instance(qual: RankQualitativeOutput) -> RankQualitativeOutput:
-    """Validate an already-parsed RankQualitativeOutput instance."""
-    _check_list_lengths(qual.strengths, qual.gaps, qual.red_flags)
-    return qual
+    """Validate an already-parsed RankQualitativeOutput instance.
+
+    Overlong arrays are truncated rather than rejected so a single extra
+    list item never fails the whole queue item.
+    """
+    strengths, gaps, red_flags = _check_list_lengths(
+        qual.strengths, qual.gaps, qual.red_flags
+    )
+    return RankQualitativeOutput(
+        behavioral_score=qual.behavioral_score,
+        career_score=qual.career_score,
+        strengths=strengths,
+        gaps=gaps,
+        red_flags=red_flags,
+        confidence=qual.confidence,
+    )
 
 
-def _check_list_lengths(strengths: list, gaps: list, red_flags: list):
-    """Validate list lengths and trivial content."""
-    if not isinstance(strengths, list) or len(strengths) > 5:
-        raise ValueError(f"strengths must be a list of max 5, got {len(strengths)}")
-    if not isinstance(gaps, list) or len(gaps) > 5:
-        raise ValueError(f"gaps must be a list of max 5, got {len(gaps)}")
-    if not isinstance(red_flags, list) or len(red_flags) > 3:
-        raise ValueError(f"red_flags must be a list of max 3, got {len(red_flags)}")
+def _check_list_lengths(
+    strengths: list, gaps: list, red_flags: list
+) -> tuple[list, list, list]:
+    """Validate and normalize list lengths.
+
+    Arrays over their allowed max are truncated (strengths/gaps ≤ 5,
+    red_flags ≤ 3); only non-list values and trivial content are fatal.
+    Returns the normalized lists.
+    """
+    def _truncate(items, max_len: int, label: str) -> list:
+        if not isinstance(items, list):
+            raise ValueError(
+                f"{label} must be a list, got {type(items).__name__}"
+            )
+        if len(items) > max_len:
+            logger.warning(
+                "Truncating %s from %d to %d items", label, len(items), max_len
+            )
+            return items[:max_len]
+        return items
+
+    n_strengths = _truncate(strengths, 5, "strengths")
+    n_gaps = _truncate(gaps, 5, "gaps")
+    n_red_flags = _truncate(red_flags, 3, "red_flags")
 
     def _non_trivial(items: list[str]) -> bool:
         return all(len(s.strip()) >= 1 for s in items)
 
-    if strengths and not _non_trivial(strengths):
+    if n_strengths and not _non_trivial(n_strengths):
         raise ValueError("strengths contain empty or trivial items")
-    if gaps and not _non_trivial(gaps):
+    if n_gaps and not _non_trivial(n_gaps):
         raise ValueError("gaps contain empty or trivial items")
+
+    return n_strengths, n_gaps, n_red_flags
 
 
 # ── Per-job evaluation ──────────────────────────────────────────────
