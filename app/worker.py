@@ -65,7 +65,7 @@ from app.services.rank import (
     _build_rank_evaluation,
     _rank_single_job,
 )
-from app.services.provider_credentials import get_user_active_provider_config
+from app.services.provider_config import get_active_provider_config
 
 logger = get_logger("app.worker")
 
@@ -181,7 +181,7 @@ async def _load_item_data(
     if job is None:
         raise ValueError(f"Job posting {item.job_posting_id} not found")
 
-    provider_config = await get_user_active_provider_config(session, item.user_id)
+    provider_config = await get_active_provider_config(session)
 
     eval_result = await session.execute(
         select(RankEvaluation).where(
@@ -434,7 +434,7 @@ async def _process_item(item: ExecutionJobItem) -> None:
         model = provider_config.get("model")
 
         if not provider or not model:
-            raise ValueError(f"User {item.user_id} has no active LLM provider configured")
+            raise ValueError("No active LLM provider configured (set one via the admin providers panel)")
 
         # Phase 2: Rank (pure computation + LLM via shared _rank_single_job)
         async def _worker_llm(messages, output_schema, _provider_config):

@@ -248,8 +248,8 @@ async def worker_session_factory(worker_engine):
 
 
 async def _seed_processing_data(db: AsyncSession):
-    """Sembrar user + candidate + job + provider credential + cola completa."""
-    from app.db.models import ProviderCredential
+    """Sembrar user + candidate + job + config global + cola completa."""
+    from app.db.models import GLOBAL_PROVIDER_CONFIG_ID, GlobalProviderConfig
 
     user = User(
         id="proc-user",
@@ -269,9 +269,10 @@ async def _seed_processing_data(db: AsyncSession):
         }],
     )
     db.add(candidate)
-    db.add(ProviderCredential(
-        user_id=user.id,
+    db.add(GlobalProviderConfig(
+        id=GLOBAL_PROVIDER_CONFIG_ID,
         provider="openai",
+        model="gpt-4o",
         api_key_encrypted="sk-plaintext-fallback",
     ))
     job = JobPosting(
