@@ -8,7 +8,7 @@ microservice.
 import pytest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.db.models import Base, CandidateProfile, ExecutionJob, ExecutionJobItem, JobPosting, User
@@ -400,7 +400,7 @@ async def test_process_item_end_to_end_completes_rank(worker_session_factory, mo
     monkeypatch.setattr("app.worker._worker_session_factory", worker_session_factory)
     monkeypatch.setattr(
         "app.worker._call_llm",
-        lambda messages, output_schema, provider, model, api_key, api_base: _valid_rank_json(),
+        lambda messages, output_schema, provider, model, api_key, api_base, usage=None: _valid_rank_json(),
     )
 
     await _process_item(seed["item"])
@@ -444,7 +444,7 @@ async def test_process_item_propagates_llm_error(worker_session_factory, monkeyp
 
     monkeypatch.setattr("app.worker._worker_session_factory", worker_session_factory)
 
-    async def boom(messages, output_schema, provider, model, api_key, api_base):
+    async def boom(messages, output_schema, provider, model, api_key, api_base, usage=None):
         raise TimeoutError("LLM timed out")
 
     monkeypatch.setattr("app.worker._call_llm", boom)
@@ -515,3 +515,101 @@ async def test_save_failure_marks_item_failed_and_parent_job_failed(worker_sessi
     assert parent.status == "failed"
     assert parent.last_error == "LLM evaluation failed: boom"
     assert parent.finished_at is not None
+
+
+@pytest.mark.asyncio
+async def test_call_llm_records_usage_into_sink(monkeypatch):
+    """El sink de usage acumula los tokens/costo reales de la respuesta LLM."""
+    from app.schemas.rank import RankQualitativeOutput
+    from app.worker import _call_llm
+
+    async def fake_acompletion(messages=None, **kwargs):
+        return SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=120, completion_tokens=45),
+            model="openai/gpt-4o",
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=('{"behavioral_score": 80, "career_score": 70, '
+                         '"strengths": ["s"], "gaps": ["g"], '
+                         '"red_flags": [], "confidence": "high"}'),
+                reasoning_content=None,
+            ))],
+        )
+
+    monkeypatch.setattr("app.worker.litellm.acompletion", fake_acompletion)
+
+    usage = {}
+    await _call_llm(
+        messages=[{"role": "user", "content": "hi"}],
+        output_schema=RankQualitativeOutput,
+        provider="openai", model="gpt-4o", api_key="k", api_base=None,
+        usage=usage,
+    )
+
+    assert usage["tokens_input"] == 120
+    assert usage["tokens_output"] == 45
+    assert usage["model_used"] == "openai/gpt-4o"
+    # Sin sink (None) no debe romper la llamada.
+    usage_none = None
+    await _call_llm(
+        messages=[{"role": "user", "content": "hi"}],
+        output_schema=RankQualitativeOutput,
+        provider="openai", model="gpt-4o", api_key="k", api_base=None,
+        usage=usage_none,
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_item_records_usage_on_ledger_row(worker_session_factory, monkeypatch):
+    """El worker acumula el usage real en la fila del ledger de créditos.
+
+    ``rank_jobs.start`` relinkea el correlation_id de la transacción al
+    ExecutionJob id, así que el UPDATE directo por ese id debe dar con la misma
+    fila (decision: "UPDATE directo en el worker").
+    """
+    from app.worker import _process_item
+
+    async with worker_session_factory() as db:
+        seed = await _seed_processing_data(db)
+        # credit_transactions vive en el backend principal, no en el schema del
+        # microservicio — la creamos a mano para el test.
+        await db.execute(text(
+            "CREATE TABLE IF NOT EXISTS credit_transactions ("
+            "id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36), "
+            "subscription_id VARCHAR(36), correlation_id VARCHAR(36), "
+            "action VARCHAR(50), credits_delta INTEGER, description TEXT, "
+            "model_used VARCHAR(100), tokens_input INTEGER DEFAULT 0, "
+            "tokens_output INTEGER DEFAULT 0, cost_usd_cents INTEGER DEFAULT 0)"
+        ))
+        await db.execute(
+            text(
+                "INSERT INTO credit_transactions "
+                "(id, user_id, correlation_id, action, credits_delta) "
+                "VALUES ('txn-1', 'proc-user', :cid, 'pipeline', -1)"
+            ),
+            {"cid": seed["exec_job"].id},
+        )
+        await db.commit()
+
+    monkeypatch.setattr("app.worker._worker_session_factory", worker_session_factory)
+
+    async def fake_llm(messages, output_schema, provider, model, api_key, api_base, usage=None):
+        if usage is not None:
+            usage.update(tokens_input=100, tokens_output=50, model_used="openai/gpt-4o")
+        return await _valid_rank_json()
+
+    monkeypatch.setattr("app.worker._call_llm", fake_llm)
+
+    await _process_item(seed["item"])
+
+    async with worker_session_factory() as db:
+        row = (await db.execute(
+            text(
+                "SELECT model_used, tokens_input, tokens_output, cost_usd_cents "
+                "FROM credit_transactions WHERE correlation_id = :cid"
+            ),
+            {"cid": seed["exec_job"].id},
+        )).one()
+
+    assert row.tokens_input == 100
+    assert row.tokens_output == 50
+    assert row.model_used == "openai/gpt-4o"

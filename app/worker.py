@@ -359,6 +359,42 @@ async def _recover_expired_leases(session: AsyncSession):
         await session.commit()
 
 
+async def _record_usage_direct(
+    db: AsyncSession, execution_job_id: str, usage: dict | None
+) -> None:
+    """Accumulate real LLM usage onto the credit ledger row for this job.
+
+    The ledger row is created by the access gate and relinked by
+    ``rank_jobs.start`` so its ``correlation_id`` equals the ExecutionJob id.
+    This microservice has no ``CreditTransaction`` model, so a direct UPDATE by
+    that id hits the same immutable row. Best-effort: never raises, and no-ops
+    when there is nothing to record or no row matches (e.g. admin bypass).
+    """
+    if not execution_job_id or not usage:
+        return
+    try:
+        await db.execute(
+            text(
+                "UPDATE credit_transactions "
+                "SET model_used = COALESCE(:model_used, model_used), "
+                "    tokens_input = tokens_input + :tokens_input, "
+                "    tokens_output = tokens_output + :tokens_output, "
+                "    cost_usd_cents = cost_usd_cents + :cost_usd_cents "
+                "WHERE correlation_id = :correlation_id"
+            ),
+            {
+                "model_used": usage.get("model_used"),
+                "tokens_input": int(usage.get("tokens_input", 0) or 0),
+                "tokens_output": int(usage.get("tokens_output", 0) or 0),
+                "cost_usd_cents": int(usage.get("cost_usd_cents", 0) or 0),
+                "correlation_id": str(execution_job_id),
+            },
+        )
+        await db.commit()
+    except Exception as exc:
+        logger.debug("Failed to record LLM usage for job %s: %s", execution_job_id, exc)
+
+
 async def _heartbeat(session: AsyncSession, worker_id: str):
     """Extend locked_until for all items this worker is processing."""
     now = datetime.now(timezone.utc)
@@ -380,6 +416,43 @@ async def _heartbeat(session: AsyncSession, worker_id: str):
 
 # ── LLM call ──────────────────────────────────────────────────────────
 
+
+def _record_usage(response: Any, usage: dict | None) -> None:
+    """Best-effort extract tokens + cost from a LiteLLM response into the sink dict.
+
+    Never raises: usage accounting must not break the LLM call path. The sink
+    is mutated in place and expects the keys ``tokens_input``, ``tokens_output``,
+    ``cost_usd_cents`` (accumulated) and ``model_used`` (last-write-wins).
+    Mirrors the main backend's accounting so costs stay consistent across
+    services.
+    """
+    if usage is None:
+        return
+    try:
+        u = getattr(response, "usage", None)
+        if u is not None:
+            input_tokens = getattr(u, "prompt_tokens", None)
+            if input_tokens is None:
+                input_tokens = getattr(u, "input_tokens", 0)
+            output_tokens = getattr(u, "completion_tokens", None)
+            if output_tokens is None:
+                output_tokens = getattr(u, "output_tokens", 0)
+            if input_tokens:
+                usage["tokens_input"] = usage.get("tokens_input", 0) + int(input_tokens)
+            if output_tokens:
+                usage["tokens_output"] = usage.get("tokens_output", 0) + int(output_tokens)
+
+        model = getattr(response, "model", None)
+        if model:
+            usage["model_used"] = model
+
+        cost = litellm.completion_cost(response=response)
+        if cost:
+            usage["cost_usd_cents"] = usage.get("cost_usd_cents", 0) + int(round(cost * 100))
+    except Exception:
+        pass
+
+
 async def _call_llm(
     messages: list[dict[str, str]],
     output_schema: type,
@@ -389,6 +462,7 @@ async def _call_llm(
     api_base: str | None,
     temperature: float = 0.3,
     max_tokens: int = 1536,
+    usage: dict | None = None,
 ) -> str:
     """Single LLM call — no session held."""
     kwargs = _build_kwargs(provider, model, api_key, api_base)
@@ -414,6 +488,7 @@ async def _call_llm(
         }
 
     response = await litellm.acompletion(messages=messages, **kwargs)
+    _record_usage(response, usage)
     message = response.choices[0].message
     content = message.content or getattr(message, "reasoning_content", None)
     if content is None:
@@ -436,6 +511,9 @@ async def _process_item(item: ExecutionJobItem) -> None:
         if not provider or not model:
             raise ValueError("No active LLM provider configured (set one via the admin providers panel)")
 
+        # Real LLM usage accumulates in this sink across all rank sub-calls.
+        usage: dict[str, Any] = {}
+
         # Phase 2: Rank (pure computation + LLM via shared _rank_single_job)
         async def _worker_llm(messages, output_schema, _provider_config):
             api_key = _provider_config.get("api_key")
@@ -448,6 +526,7 @@ async def _process_item(item: ExecutionJobItem) -> None:
                 model=_provider_config["model"],
                 api_key=api_key,
                 api_base=api_base,
+                usage=usage,
             )
             return raw
 
@@ -497,10 +576,15 @@ async def _process_item(item: ExecutionJobItem) -> None:
                 db, item, c, j, evaluation, ev_data["llm_output"],
                 provider, model, latency_ms,
             )
+            # Accumulate real tokens/cost onto the ledger row whose
+            # correlation_id was relinked to this ExecutionJob id.
+            await _record_usage_direct(db, item.execution_job_id, usage)
 
         logger.info(
-            "Item %s completed | job=%s score=%d verdict=%s latency=%dms",
+            "Item %s completed | job=%s score=%d verdict=%s latency=%dms "
+            "tokens_in=%d tokens_out=%d",
             item.id, job.title, ev_data["overall"], ev_data["verdict"], latency_ms,
+            usage.get("tokens_input", 0), usage.get("tokens_output", 0),
         )
 
 
